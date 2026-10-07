@@ -57,11 +57,16 @@ def generate_world():
         grid[cr.centery][cr.centerx] = CHEST
         grid[ck.centery][ck.centerx] = KEY
 
-    # Traps: only in middle rooms (never the start room or chest room), never on key/chest
-    if len(rooms) >= 3:
-        spots = [(x, y) for rm in rooms[1:-1]
+    # Traps: any room floor tile except the spawn area, the key/chest tiles and the
+    # ring around the chest (kept clear so the guard has room to patrol)
+    if len(rooms) >= 2:
+        sx0, sy0 = rooms[0].topleft
+        ccx, ccy = rooms[-1].center
+        spots = [(x, y) for rm in rooms
                  for y in range(rm.top, rm.bottom) for x in range(rm.left, rm.right)
-                 if grid[y][x] == FLOOR]
+                 if grid[y][x] == FLOOR
+                 and max(abs(x-sx0), abs(y-sy0)) > 1
+                 and max(abs(x-ccx), abs(y-ccy)) > 1]
         random.shuffle(spots)
         placed = 0
         for x, y in spots:
@@ -165,19 +170,29 @@ class GameEngine:
         self.status = message
 
     def make_guard(self):
-        chest = next(((c, r) for r in range(ROWS) for c in range(COLS)
-                      if self.grid[r][c] == CHEST), None)
-        if chest is None:
+        def find(tile):
+            return next(((c, r) for r in range(ROWS) for c in range(COLS)
+                         if self.grid[r][c] == tile), None)
+        chest, key = find(CHEST), find(KEY)
+        if chest is None or key is None:
             return None
         cc, cr = chest
         start_tile = (self.start_pos[0] // TILE, self.start_pos[1] // TILE)
         # patrol beside the chest: row above, row below, column left, column right
-        for a, b in [((cc-1,cr-1),(cc+1,cr-1)), ((cc-1,cr+1),(cc+1,cr+1)),
-                     ((cc-1,cr-1),(cc-1,cr+1)), ((cc+1,cr-1),(cc+1,cr+1))]:
+        lines = [((cc-1,cr-1),(cc+1,cr-1)), ((cc-1,cr+1),(cc+1,cr+1)),
+                 ((cc-1,cr-1),(cc-1,cr+1)), ((cc+1,cr-1),(cc+1,cr+1))]
+        # fallback: shorter 1-tile patrols (each half of a line) if a full line blocks a route
+        halves = []
+        for a, b in lines:
+            m = ((a[0]+b[0])//2, (a[1]+b[1])//2)
+            halves += [(a, m), (m, b)]
+        for a, b in lines + halves:
             tiles = {a, b, ((a[0]+b[0])//2, (a[1]+b[1])//2)}
             if (all(0 <= c < COLS and 0 <= r < ROWS and self.grid[r][c] == FLOOR
                     for c, r in tiles)
-                    and can_reach(self.grid, start_tile, chest, tiles)):
+                    # key AND chest must stay reachable without crossing the patrol line
+                    and all(can_reach(self.grid, start_tile, goal, tiles)
+                            for goal in (chest, key))):
                 return Guard(a, b)
         return None
 
