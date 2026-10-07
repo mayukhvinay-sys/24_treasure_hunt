@@ -3,8 +3,26 @@ import random
 
 TILE = 40
 COLS, ROWS = 20, 15
-WALL, FLOOR, CHEST, KEY = 0, 1, 2, 3
+WALL, FLOOR, CHEST, KEY, TRAP = 0, 1, 2, 3, 4
 SPEED = 3
+GUARD_SPEED = 2
+TRAP_COUNT = 6
+MINI_TILE = 5   # pixel size of one tile in the mini-map
+
+def can_reach(grid, start, goal, blocked=()):
+    """BFS over tiles (col,row). WALL, TRAP and `blocked` tiles are impassable."""
+    seen, queue = {start}, [start]
+    while queue:
+        c, r = queue.pop(0)
+        if (c, r) == goal:
+            return True
+        for nc, nr in ((c+1,r),(c-1,r),(c,r+1),(c,r-1)):
+            if (0 <= nr < ROWS and 0 <= nc < COLS and (nc,nr) not in seen
+                    and grid[nr][nc] not in (WALL, TRAP) and (nc,nr) not in blocked):
+                seen.add((nc,nr))
+                queue.append((nc,nr))
+    return False
+
 
 def generate_world():
     grid = [[WALL]*COLS for _ in range(ROWS)]
@@ -39,6 +57,22 @@ def generate_world():
         grid[cr.centery][cr.centerx] = CHEST
         grid[ck.centery][ck.centerx] = KEY
 
+    # Traps: only in middle rooms (never the start room or chest room), never on key/chest
+    if len(rooms) >= 3:
+        spots = [(x, y) for rm in rooms[1:-1]
+                 for y in range(rm.top, rm.bottom) for x in range(rm.left, rm.right)
+                 if grid[y][x] == FLOOR]
+        random.shuffle(spots)
+        placed = 0
+        for x, y in spots:
+            if placed >= TRAP_COUNT:
+                break
+            grid[y][x] = TRAP
+            if (can_reach(grid, rooms[0].topleft, rooms[-1].center) and
+                    can_reach(grid, rooms[0].topleft, rooms[-2].center)):
+                placed += 1
+            else:
+                grid[y][x] = FLOOR   # this trap would block the level, undo it
     start = rooms[0] if rooms else None
     return grid, start
 
@@ -47,6 +81,7 @@ COLORS = {
     FLOOR: (200,190,170),
     CHEST: (200,160,30),
     KEY: (220,220,60),
+    TRAP: (110,45,45),
 }
 
 class Player:
@@ -78,6 +113,26 @@ class Player:
             pygame.draw.circle(screen, (220,220,60), (self.rect.right-6, self.rect.top+6), 5)
 
 
+class Guard:
+    def __init__(self, p1, p2):
+        # p1, p2 are (col,row) tiles; patrol runs along one row or one column
+        self.points = [(p1[0]*TILE+6, p1[1]*TILE+6), (p2[0]*TILE+6, p2[1]*TILE+6)]
+        self.target = 1
+        self.rect = pygame.Rect(self.points[0][0], self.points[0][1], 28, 28)
+
+    def update(self):
+        tx, ty = self.points[self.target]
+        dx = max(-GUARD_SPEED, min(GUARD_SPEED, tx - self.rect.x))
+        dy = max(-GUARD_SPEED, min(GUARD_SPEED, ty - self.rect.y))
+        self.rect.move_ip(dx, dy)
+        if self.rect.topleft == (tx, ty):
+            self.target = 1 - self.target      # turn around
+
+    def draw(self, screen):
+        pygame.draw.rect(screen, (200,50,50), self.rect, border_radius=6)
+        pygame.draw.rect(screen, (255,255,255), self.rect, 2, border_radius=6)
+
+
 WIDTH = COLS * TILE
 HEIGHT = ROWS * TILE + 50
 FPS = 60
@@ -100,8 +155,31 @@ class GameEngine:
         else:
             sx, sy = TILE+6, TILE+6
         self.player = Player(sx, sy)
+        self.start_pos = (sx, sy)
+        self.guard = self.make_guard()
         self.won = False
         self.status = "Find the KEY, then the CHEST!"
+
+    def respawn_player(self, message):
+        self.player.rect.topleft = self.start_pos
+        self.status = message
+
+    def make_guard(self):
+        chest = next(((c, r) for r in range(ROWS) for c in range(COLS)
+                      if self.grid[r][c] == CHEST), None)
+        if chest is None:
+            return None
+        cc, cr = chest
+        start_tile = (self.start_pos[0] // TILE, self.start_pos[1] // TILE)
+        # patrol beside the chest: row above, row below, column left, column right
+        for a, b in [((cc-1,cr-1),(cc+1,cr-1)), ((cc-1,cr+1),(cc+1,cr+1)),
+                     ((cc-1,cr-1),(cc-1,cr+1)), ((cc+1,cr-1),(cc+1,cr+1))]:
+            tiles = {a, b, ((a[0]+b[0])//2, (a[1]+b[1])//2)}
+            if (all(0 <= c < COLS and 0 <= r < ROWS and self.grid[r][c] == FLOOR
+                    for c, r in tiles)
+                    and can_reach(self.grid, start_tile, chest, tiles)):
+                return Guard(a, b)
+        return None
 
     def handle_events(self):
         for event in pygame.event.get():
@@ -124,6 +202,35 @@ class GameEngine:
             elif cell == CHEST and self.player.has_key:
                 self.won = True
                 self.status = "Treasure found!"
+            elif cell == TRAP:
+                self.respawn_player("Trap! Back to start.")
+
+        if self.guard and not self.won:
+            self.guard.update()
+            if self.player.rect.colliderect(self.guard.rect):
+                self.respawn_player("Caught by the guard!")
+
+    def draw_minimap(self):
+        s = MINI_TILE
+        ox, oy = WIDTH - COLS*s - 8, 8
+        pygame.draw.rect(self.screen, (10,10,15), (ox-2, oy-2, COLS*s+4, ROWS*s+4))
+        for r in range(ROWS):
+            for c in range(COLS):
+                color = (80,70,100) if self.grid[r][c] == WALL else (200,190,170)
+                pygame.draw.rect(self.screen, color, (ox+c*s, oy+r*s, s, s))
+        px = ox + self.player.rect.centerx * s // TILE
+        py = oy + self.player.rect.centery * s // TILE
+        pygame.draw.circle(self.screen, (60,120,220), (px, py), 3)
+
+    def draw_inventory(self):
+        slot = pygame.Rect(WIDTH - 48, ROWS*TILE + 7, 36, 36)
+        pygame.draw.rect(self.screen, (45,45,65), slot, border_radius=4)
+        pygame.draw.rect(self.screen, (120,120,150), slot, 2, border_radius=4)
+        if self.player.has_key:
+            gold = (255,240,60)
+            pygame.draw.circle(self.screen, gold, (slot.x+12, slot.centery), 7)
+            pygame.draw.rect(self.screen, gold, (slot.x+16, slot.centery-2, 16, 4))
+            pygame.draw.rect(self.screen, gold, (slot.x+26, slot.centery, 3, 7))
 
     def draw(self):
         self.screen.fill((30,25,40))
@@ -136,11 +243,19 @@ class GameEngine:
                     pygame.draw.circle(self.screen, (255,240,60),(c*TILE+TILE//2, r*TILE+TILE//2),10)
                 elif cell == CHEST:
                     pygame.draw.rect(self.screen,(180,120,20),rect.inflate(-12,-12),border_radius=4)
+                elif cell == TRAP:
+                    t = rect.inflate(-14,-14)
+                    pygame.draw.line(self.screen,(230,50,50),t.topleft,t.bottomright,4)
+                    pygame.draw.line(self.screen,(230,50,50),t.topright,t.bottomleft,4)
+        if self.guard:
+            self.guard.draw(self.screen)
         self.player.draw(self.screen)
+        self.draw_minimap()
         hud = pygame.Rect(0,ROWS*TILE,WIDTH,50)
         pygame.draw.rect(self.screen,(20,20,35),hud)
         st = self.font.render(self.status+"  |  R=Restart", True, (200,200,200))
         self.screen.blit(st,(8,ROWS*TILE+13))
+        self.draw_inventory()
         if self.won:
             ov=pygame.Surface((WIDTH,ROWS*TILE),pygame.SRCALPHA)
             ov.fill((0,0,0,140))
